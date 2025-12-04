@@ -14,10 +14,9 @@ FF14에 사용할 수 있을지도 모르는 프로그램입니다
 # Troubleshooting
 만약 위쪽 버튼을 눌렀을 때 에러가 발생한다면 아래의 방법을 시도해 보세요.
 
-1. [.NET Frameworkd 4.8.1](https://dotnet.microsoft.com/en-us/download/dotnet-framework/net481) 설치 또는 복구
-2. 관리자 권한으로 실행
-3. 백신/방화벽 확인
-4. WMI Repository 재빌드
+1. 관리자 권한으로 실행
+2. 백신/방화벽 확인
+3. WMI Repository 재빌드
 - 명령 프롬프트를 관리지 권한으로 엽니다.
 - 아래의 명령을 실행합니다.
 ```
