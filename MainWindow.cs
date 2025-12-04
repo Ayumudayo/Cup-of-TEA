@@ -43,13 +43,23 @@ namespace CupofTEA
 
             // 쿼리로 명령줄을 가져온다
             var commandLine = "";
-            using (var searcher = new ManagementObjectSearcher($"SELECT CommandLine FROM Win32_Process WHERE ProcessId = " + process.Id))
+            try
             {
-                foreach (ManagementObject obj in searcher.Get())
+                var query = $"SELECT CommandLine FROM Win32_Process WHERE ProcessId = {process.Id}";
+                using (var searcher = new ManagementObjectSearcher("root\\CIMV2", query))
+                using (var objects = searcher.Get())
                 {
-                    commandLine = obj["CommandLine"].ToString();
-                    break;
+                    foreach (var obj in objects)
+                    {
+                        commandLine = obj["CommandLine"]?.ToString() ?? string.Empty;
+                        break;
+                    }
                 }
+            }
+            catch (ManagementException ex)
+            {
+                MessageBox.Show($"WMI 오류: {ex.Message}\n오류 코드: {ex.ErrorCode}\n상세 정보: {ex.ErrorInformation}");
+                throw;
             }
 
             try
@@ -61,7 +71,7 @@ namespace CupofTEA
             catch (Exception ex)
             {
                 MessageBox.Show("암호화 실패!!!");
-                throw ex;
+                throw;
             }
         }
 
@@ -70,7 +80,7 @@ namespace CupofTEA
             try
             {
                 var decryptedCommand = Decrypt(File.ReadAllBytes(Path.ChangeExtension(Application.ExecutablePath, ".dat")));
-                NativeMethods.WinExec(decryptedCommand, 5U);
+                Process.Start(new ProcessStartInfo(decryptedCommand) { UseShellExecute = true });
                 Application.Exit();
             }
             catch
@@ -113,105 +123,130 @@ namespace CupofTEA
         public byte[] EncryptWithAesThenDpapi(string data)
         {
             byte[] encryptedDataWithAes = EncryptWithAes(data);
-            
-            byte[] encryptedDataWithDpapi = ProtectedData.Protect(encryptedDataWithAes, null, DataProtectionScope.LocalMachine);
-
-            return encryptedDataWithDpapi;
+            try
+            {
+                return ProtectedData.Protect(encryptedDataWithAes, null, DataProtectionScope.CurrentUser);
+            }
+            finally
+            {
+                Array.Clear(encryptedDataWithAes, 0, encryptedDataWithAes.Length);
+            }
         }
 
         private byte[] EncryptWithAes(string data)
         {
             byte[] key = GetKey();
-            byte[] iv;
-            byte[] encryptedData;
-            using (Aes aesAlg = Aes.Create())
+            byte[] salt = new byte[16];
+            byte[] aesKey = new byte[32]; // AES-256
+            byte[] nonce = new byte[12]; // GCM standard nonce size
+            byte[] tag = new byte[16]; // GCM standard tag size
+            byte[] ciphertext = null;
+            byte[] plaintextBytes = Encoding.UTF8.GetBytes(data);
+
+            try
             {
-                aesAlg.Mode = CipherMode.CBC;
-                aesAlg.KeySize = 256;
-                aesAlg.BlockSize = 128;
-
-                // key의 역순에서 8바이트를 Salt로 사용
-                using (var rfc2898DeriveBytes = new Rfc2898DeriveBytes(key, key.Reverse().Take(8).ToArray(), 1000))
-                    aesAlg.Key = rfc2898DeriveBytes.GetBytes(aesAlg.KeySize / 8);
-
-                // IV는 매 암호화 과정마다 변경됨
-                aesAlg.GenerateIV();
-                iv = aesAlg.IV;
-
-                using (ICryptoTransform encryptor = aesAlg.CreateEncryptor(aesAlg.Key, aesAlg.IV))
-                using (MemoryStream msEncrypt = new MemoryStream())
+                using (var rng = RandomNumberGenerator.Create())
                 {
-                    using (CryptoStream csEncrypt = new CryptoStream(msEncrypt, encryptor, CryptoStreamMode.Write))
-                    using (StreamWriter swEncrypt = new StreamWriter(csEncrypt))
-                    {
-                        swEncrypt.Write(data);
-                        // StreamWriter를 닫지 않고, CryptoStream을 닫으면 데이터가 올바르게 Flush 되지 않을 수 있음
-                        // SW를 이용해 CS에 데이터를 쓰면,
-                        // 데이터는 암호화 되어 msEncrypt에 저장됨
-                    }
-                    // IV 다음에 암호화된 데이터 저장
-                    // 16Byte(IV) + EncryptedData
-                    encryptedData = iv.Concat(msEncrypt.ToArray()).ToArray();
+                    rng.GetBytes(salt);
+                    rng.GetBytes(nonce);
                 }
+
+                using (var rfc2898DeriveBytes = new Rfc2898DeriveBytes(key, salt, 100000, HashAlgorithmName.SHA256))
+                {
+                    byte[] derivedKey = rfc2898DeriveBytes.GetBytes(32);
+                    Array.Copy(derivedKey, aesKey, 32);
+                    Array.Clear(derivedKey, 0, derivedKey.Length);
+                }
+
+                ciphertext = new byte[plaintextBytes.Length];
+
+                using (var aesGcm = new AesGcm(aesKey, 16)) // 16 bytes tag size
+                {
+                    aesGcm.Encrypt(nonce, plaintextBytes, ciphertext, tag);
+                }
+
+                // Structure: Salt(16) + Nonce(12) + Tag(16) + Ciphertext
+                byte[] result = new byte[salt.Length + nonce.Length + tag.Length + ciphertext.Length];
+                Buffer.BlockCopy(salt, 0, result, 0, salt.Length);
+                Buffer.BlockCopy(nonce, 0, result, salt.Length, nonce.Length);
+                Buffer.BlockCopy(tag, 0, result, salt.Length + nonce.Length, tag.Length);
+                Buffer.BlockCopy(ciphertext, 0, result, salt.Length + nonce.Length + tag.Length, ciphertext.Length);
+
+                return result;
             }
-            return encryptedData;
+            finally
+            {
+                Array.Clear(key, 0, key.Length);
+                Array.Clear(aesKey, 0, aesKey.Length);
+                Array.Clear(plaintextBytes, 0, plaintextBytes.Length);
+                // salt, nonce, tag, ciphertext are public or encrypted, but good practice to clear if reused, though here they are local.
+                // We don't clear salt/nonce/tag/ciphertext immediately as they are part of the result, but intermediate aesKey and plaintext MUST be cleared.
+            }
         }
 
         private string DecryptWithDpapiThenAes(byte[] encryptedData)
         {
             // Step 1: DPAPI를 사용하여 복호화
-            byte[] decryptedDataWithDpapi;
+            byte[] decryptedDataWithDpapi = null;
             try
             {
-                decryptedDataWithDpapi = ProtectedData.Unprotect(encryptedData, null, DataProtectionScope.LocalMachine);
+                decryptedDataWithDpapi = ProtectedData.Unprotect(encryptedData, null, DataProtectionScope.CurrentUser);
+                // Step 2: AES를 사용하여 복호화
+                return DecryptWithAes(decryptedDataWithDpapi);
             }
             catch (Exception ex)
             {
                 throw new Exception("복호화 실패: " + ex.Message);
             }
-
-            // Step 2: AES를 사용하여 복호화
-            string decryptedText;
-            try
+            finally
             {
-                decryptedText = DecryptWithAes(decryptedDataWithDpapi);
-            }
-            catch (Exception ex)
-            {
-                throw new Exception("복호화 실패: " + ex.Message);
-            }
-
-            return decryptedText;
-        }
-
-        private string DecryptWithAes(byte[] encryptedDataWithIv)
-        {
-            byte[] key = GetKey();
-            byte[] iv = encryptedDataWithIv.Take(16).ToArray();
-            byte[] encryptedData = encryptedDataWithIv.Skip(16).ToArray();
-
-            string plaintext = null;
-            using (Aes aesAlg = Aes.Create())
-            {
-                aesAlg.Mode = CipherMode.CBC;
-                aesAlg.KeySize = 256;
-                aesAlg.BlockSize = 128;
-                using (var rfc2898DeriveBytes = new Rfc2898DeriveBytes(key, key.Reverse().Take(8).ToArray(), 1000))
-                    aesAlg.Key = rfc2898DeriveBytes.GetBytes(aesAlg.KeySize / 8);
-                aesAlg.IV = iv;
-                
-                // 같은 키와 IV로 복호화 진행
-                ICryptoTransform decryptor = aesAlg.CreateDecryptor(aesAlg.Key, aesAlg.IV);
-
-                using (MemoryStream msDecrypt = new MemoryStream(encryptedData))
-                using (CryptoStream csDecrypt = new CryptoStream(msDecrypt, decryptor, CryptoStreamMode.Read))
-                using (StreamReader srDecrypt = new StreamReader(csDecrypt))
+                if (decryptedDataWithDpapi != null)
                 {
-                    plaintext = srDecrypt.ReadToEnd();
+                    Array.Clear(decryptedDataWithDpapi, 0, decryptedDataWithDpapi.Length);
                 }
             }
+        }
 
-            return plaintext;
+        private string DecryptWithAes(byte[] encryptedDataWithMeta)
+        {
+            if (encryptedDataWithMeta.Length < 16 + 12 + 16)
+                throw new ArgumentException("Invalid encrypted data format");
+
+            byte[] key = GetKey();
+            byte[] salt = new byte[16];
+            byte[] nonce = new byte[12];
+            byte[] tag = new byte[16];
+            byte[] ciphertext = new byte[encryptedDataWithMeta.Length - 16 - 12 - 16];
+            byte[] aesKey = new byte[32];
+            byte[] plaintextBytes = new byte[ciphertext.Length];
+
+            try
+            {
+                Buffer.BlockCopy(encryptedDataWithMeta, 0, salt, 0, 16);
+                Buffer.BlockCopy(encryptedDataWithMeta, 16, nonce, 0, 12);
+                Buffer.BlockCopy(encryptedDataWithMeta, 16 + 12, tag, 0, 16);
+                Buffer.BlockCopy(encryptedDataWithMeta, 16 + 12 + 16, ciphertext, 0, ciphertext.Length);
+
+                using (var rfc2898DeriveBytes = new Rfc2898DeriveBytes(key, salt, 100000, HashAlgorithmName.SHA256))
+                {
+                    byte[] derivedKey = rfc2898DeriveBytes.GetBytes(32);
+                    Array.Copy(derivedKey, aesKey, 32);
+                    Array.Clear(derivedKey, 0, derivedKey.Length);
+                }
+
+                using (var aesGcm = new AesGcm(aesKey, 16))
+                {
+                    aesGcm.Decrypt(nonce, ciphertext, tag, plaintextBytes);
+                }
+
+                return Encoding.UTF8.GetString(plaintextBytes);
+            }
+            finally
+            {
+                Array.Clear(key, 0, key.Length);
+                Array.Clear(aesKey, 0, aesKey.Length);
+                Array.Clear(plaintextBytes, 0, plaintextBytes.Length);
+            }
         }
 
         private byte[] Encrypt(string data)
@@ -222,12 +257,6 @@ namespace CupofTEA
         private string Decrypt(byte[] data)
         {
             return DecryptWithDpapiThenAes(data);
-        }
-
-        private static class NativeMethods
-        {
-            [DllImport("kernel32.dll")]
-            public static extern uint WinExec(string lpCmdLine, uint uCmdShow);
         }
     }
 }
